@@ -10,7 +10,17 @@
     seriesCache: {},        // quoteId -> Promise<ctx>
     universe: App.Store.get('universe', []) || [],
     dashboardRangeYears: 1,
-    lastBacktest: null
+    lastBacktest: null,
+    tmRows: null,           // 回到那一天：[{u,ctx,snap}]
+    tmSymbol: null,         // 当前展开的标的
+    tmWindow: 5,            // 回看窗口（年，0=全部）
+    tmDate: null,           // 最近一次复盘的日期
+    acSim: null,            // 交互式模拟账户引擎状态（cash/holdings/trades/ledger/cursor…）
+    acWatch: [],            // 交易标的（自选）：[{quoteId,name,market}]
+    acActiveId: null,       // 当前交易标 quoteId
+    acSide: 'buy',          // 交易方向 buy / sell
+    acPriceMap: {},         // quoteId -> [{date,close}] 不复权
+    acDivMap: {}            // quoteId -> [分红事件]
   };
 
   /* ---------------- 通用小组件 ---------------- */
@@ -370,24 +380,27 @@
   /* ============================================================
    * 四、滚雪球回测
    * ============================================================ */
-  function renderUniverse() {
-    const box = U.$('#uniList');
-    if (!state.universe.length) { box.innerHTML = '<div class="small-hint">还没有标的，先在上方搜索添加。</div>'; return; }
-    box.innerHTML = state.universe.map((u, i) =>
-      '<div class="uni-item"><span>' + u.name + ' <span class="badge">' + (u.market === 'HK' ? 'HK' : 'A') + '</span></span>' +
-      '<span class="x" data-i="' + i + '">✕</span></div>').join('');
-    U.$$('.uni-item .x', box).forEach(x => x.addEventListener('click', () => {
-      state.universe.splice(+x.dataset.i, 1);
-      App.Store.set('universe', state.universe);
-      renderUniverse();
-    }));
+  function renderUniverseList() {
+    ['#uniList', '#tmUniList'].forEach(sel => {
+      const box = U.$(sel);
+      if (!box) return;
+      if (!state.universe.length) { box.innerHTML = '<div class="small-hint">还没有标的，先在上方搜索添加。</div>'; return; }
+      box.innerHTML = state.universe.map((u, i) =>
+        '<div class="uni-item"><span>' + u.name + ' <span class="badge">' + (u.market === 'HK' ? 'HK' : 'A') + '</span></span>' +
+        '<span class="x" data-i="' + i + '">✕</span></div>').join('');
+      U.$$('.uni-item .x', box).forEach(x => x.addEventListener('click', () => {
+        state.universe.splice(+x.dataset.i, 1);
+        App.Store.set('universe', state.universe);
+        renderUniverseList();
+      }));
+    });
   }
 
   function addUniverse(r) {
     if (state.universe.some(u => u.quoteId === r.quoteId)) { U.toast('已在标的池中'); return; }
     state.universe.push({ quoteId: r.quoteId, name: r.name, market: r.market });
     App.Store.set('universe', state.universe);
-    renderUniverse();
+    renderUniverseList();
   }
 
   function runBacktest() {
@@ -543,6 +556,496 @@
     }
   }
 
+  /* ============================================================
+   * 六、回到那一天（时间旅行复盘）
+   * ============================================================ */
+  /** 计算某标的在 dateStr（该日或之前最近交易日）的快照 */
+  function tmSnapshot(ctx, dateStr, windowYears) {
+    const s = ctx.series;
+    if (!s.length) return null;
+    const i = U.lowerIndex(s.map(x => x.date), dateStr);
+    if (i < 0) return null;
+    const row = s[i];
+    // 分位窗口：截至那天、往前 windowYears 年（0=全部历史）
+    const from = windowYears ? U.addDays(row.date, -Math.round(windowYears * 365.25)) : null;
+    let win = from ? s.slice(0, i + 1).filter(x => x.date >= from) : s.slice(0, i + 1);
+    const pePct = I.percentileRank(win.map(x => x.pe), row.pe);
+    const pbPct = I.percentileRank(win.map(x => x.pb), row.pb);
+    // 距当时历史高点回撤
+    let peak = -Infinity, peakDate = null;
+    for (let j = 0; j <= i; j++) if (s[j].close > peak) { peak = s[j].close; peakDate = s[j].date; }
+    const prev = i > 0 ? s[i - 1] : row;
+    return {
+      i, date: row.date, close: row.close, pe: row.pe, pb: row.pb,
+      chg: prev.close ? row.close / prev.close - 1 : 0,
+      dd: peak > 0 ? row.close / peak - 1 : 0, peak, peakDate,
+      pePct, pbPct
+    };
+  }
+
+  function runTimeMachine() {
+    const dateStr = U.$('#tmDate').value;
+    const wy = parseInt(U.$('#tmWindow').value, 10) || 0;
+    const st = U.$('#tmStatus');
+    if (!state.universe.length) { U.toast('请先添加至少 1 只标的', true); return; }
+    if (!dateStr) { U.toast('请先选择日期', true); return; }
+
+    U.$('#tmResult').classList.add('hidden');
+    st.innerHTML = '<span class="loading"></span>正在加载 ' + state.universe.length + ' 只标的的历史数据…';
+    state.tmWindow = wy;
+
+    const jobs = state.universe.map(u => loadSeries(u.quoteId).then(ctx => ({ u, ctx })).catch(e => ({ u, err: e })));
+    Promise.all(jobs).then(results => {
+      const ok = results.filter(r => r.ctx && r.ctx.series && r.ctx.series.length);
+      const bad = results.filter(r => !ok.includes(r));
+      if (!ok.length) { st.innerHTML = '<span style="color:#ff5c5c">所有标的数据加载失败，可能被限流，请稍后重试或点「数据自检」。</span>'; return; }
+
+      const rows = ok.map(r => ({ u: r.u, ctx: r.ctx, snap: tmSnapshot(r.ctx, dateStr, wy) })).filter(r => r.snap);
+      if (!rows.length) { st.innerHTML = '<span style="color:#ff5c5c">所选日期早于所有标的的数据起点，请选晚一点。</span>'; return; }
+
+      state.tmRows = rows;
+      state.tmDate = dateStr;
+      if (!state.tmSymbol || !rows.some(r => r.u.quoteId === state.tmSymbol)) state.tmSymbol = rows[0].u.quoteId;
+
+      U.$('#tmResultTitle').textContent = '回到 ' + dateStr;
+      U.$('#tmResultMeta').textContent = '各标的取该日或之前最近交易日 · 分位窗口 ' + (wy ? '近' + wy + '年' : '全部历史');
+      renderTmTable(rows);
+      renderTmCharts();
+      U.$('#tmResult').classList.remove('hidden');
+      st.innerHTML = (bad.length ? '⚠ 已跳过：' + bad.map(b => b.u.name).join('、') + '；' : '') +
+        '<span style="color:#2fbf71">✔ 已回到 ' + rows[0].snap.date + '（点击表中标的大图查看其K线）</span>';
+    });
+  }
+
+  function renderTmTable(rows) {
+    const head = '<thead><tr><th>标的</th><th>当日收盘</th><th>当日涨跌</th><th>PE</th><th>PE分位</th>' +
+      '<th>PB</th><th>PB分位</th><th>距当时高点回撤</th></tr></thead>';
+    const body = rows.map(r => {
+      const s = r.snap, c = r.ctx;
+      const cur = c.market === 'HK' ? ' HKD' : '';
+      const sel = r.u.quoteId === state.tmSymbol ? ' class="row-sel"' : '';
+      return '<tr data-qid="' + r.u.quoteId + '"' + sel + '>' +
+        '<td>' + r.u.name + ' <span class="badge">' + (c.market === 'HK' ? 'HK' : 'A') + '</span></td>' +
+        '<td class="mono">' + U.fmt(s.close, 2) + cur + '</td>' +
+        '<td class="' + U.cls(s.chg) + '">' + U.signed(s.chg * 100, 2) + '%</td>' +
+        '<td class="mono">' + U.fmt(s.pe, 2) + '</td>' +
+        '<td>' + (s.pePct == null ? '—' : pctPill(s.pePct)) + '</td>' +
+        '<td class="mono">' + U.fmt(s.pb, 2) + '</td>' +
+        '<td>' + (s.pbPct == null ? '—' : pctPill(s.pbPct)) + '</td>' +
+        '<td class="' + U.cls(s.dd) + '">' + U.fmt(s.dd * 100, 2) + '%</td>' +
+        '</tr>';
+    }).join('');
+    U.$('#tmTable').innerHTML = head + '<tbody>' + body + '</tbody>';
+    U.$$('#tmTable tbody tr').forEach(tr => tr.addEventListener('click', () => {
+      state.tmSymbol = tr.dataset.qid;
+      renderTmTable(state.tmRows);
+      renderTmCharts();
+    }));
+  }
+
+  function renderTmCharts() {
+    const rows = state.tmRows || [];
+    const row = rows.find(r => r.u.quoteId === state.tmSymbol);
+    if (!row || !row.snap) return;
+    const s = row.ctx.series;
+    const wy = state.tmWindow;
+    const snap = row.snap;
+
+    // 只取到那一天为止，且按窗口截取
+    const viewAll = s.slice(0, snap.i + 1);
+    const from = wy ? U.addDays(viewAll[viewAll.length - 1].date, -Math.round(wy * 365.25)) : null;
+    const view = from ? viewAll.filter(x => x.date >= from) : viewAll;
+    const dates = view.map(x => x.date);
+    const close = view.map(x => x.close);
+    const eps = view.map(x => {
+      const px = x.rawClose != null ? x.rawClose : x.close;
+      return x.pe > 0 ? px / x.pe : null;
+    });
+    const peVals = view.map(x => x.pe).filter(v => v != null && isFinite(v));
+    const p20 = I.valueAtPercentile(peVals, 20), p80 = I.valueAtPercentile(peVals, 80);
+    const band = { upper: eps.map(e => e != null && p80 ? e * p80 : null), lower: eps.map(e => e != null && p20 ? e * p20 : null) };
+
+    U.$('#tmChartTitle').textContent = row.u.name + ' · 截至 ' + snap.date + ' 的K线';
+    Chart.autoResize(U.$('#tmPriceChart'), {
+      dates, height: 300, yFormat: v => U.fmt(v, 0),
+      band, markers: [{ date: snap.date, color: '#f0b73f' }],
+      series: [
+        { name: '收盘价', values: close, color: '#4a9eff', width: 1.8 },
+        { name: 'PE20%分位对应价', values: band.lower, color: '#2fbf71', width: 1, dash: '4,4' },
+        { name: 'PE80%分位对应价', values: band.upper, color: '#ff5c5c', width: 1, dash: '4,4' }
+      ]
+    });
+
+    // 分位曲线：在完整序列上滚动计算，再按 view 日期取用（口径与表中分位一致）
+    const idxOf = {}; s.forEach((x, i) => idxOf[x.date] = i);
+    const pctPe = I.rollingPercentile(s, 'pe', wy);
+    const pctPb = I.rollingPercentile(s, 'pb', wy);
+    Chart.autoResize(U.$('#tmPeChart'), {
+      dates, height: 220, zeroLine: true, yFormat: v => U.fmt(v, 0) + '%',
+      markers: [{ date: snap.date, color: '#f0b73f' }],
+      series: [{ name: 'PE分位', values: dates.map(d => pctPe[idxOf[d]]), color: '#f0b73f', width: 1.6 }]
+    });
+    Chart.autoResize(U.$('#tmPbChart'), {
+      dates, height: 220, zeroLine: true, yFormat: v => U.fmt(v, 0) + '%',
+      markers: [{ date: snap.date, color: '#7c5cff' }],
+      series: [{ name: 'PB分位', values: dates.map(d => pctPb[idxOf[d]]), color: '#7c5cff', width: 1.6 }]
+    });
+  }
+
+  /* ============================================================
+   * 七、模拟账户 · 交互交易台
+   * ============================================================ */
+  const Sim = App.Engine.Sim;
+  const AC_KEY = 'acSim';
+
+  /** 用当前「穿越设置」表单创建全新账户状态 */
+  function acNewSim() {
+    const start = U.$('#acStartDate').value || U.addDays(U.today(), -365 * 5);
+    const cash = U.num(U.$('#acCash').value) || 1000000;
+    const fx = U.num(U.$('#acFx').value) || 0.92;
+    return Sim.create(cash, start, {
+      fx, taxApplies: U.$('#acTax').checked, reinvest: U.$('#acReinvest').checked
+    });
+  }
+
+  function acSave() {
+    App.Store.set(AC_KEY, { sim: state.acSim, watch: state.acWatch, active: state.acActiveId });
+  }
+
+  function acRestore() {
+    const saved = App.Store.get(AC_KEY, null);
+    if (saved && saved.sim && saved.sim.startDate) {
+      state.acSim = saved.sim;
+      state.acWatch = saved.watch || [];
+      state.acActiveId = saved.active || null;
+      return true;
+    }
+    return false;
+  }
+
+  /** 加载某标的的不复权行情 + 分红（带缓存；缓存不持久化，刷新后按需重载） */
+  function acEnsure(quoteId) {
+    if (state.acPriceMap[quoteId]) return Promise.resolve(state.acPriceMap[quoteId]);
+    const start = U.addDays(state.acSim.startDate, -10), end = U.today();
+    return Promise.all([
+      Data.getKlineRaw(quoteId, start, end),
+      Data.getDividends(quoteId)
+    ]).then(([rows, divs]) => {
+      state.acPriceMap[quoteId] = rows || [];
+      state.acDivMap[quoteId] = divs || [];
+      return state.acPriceMap[quoteId];
+    });
+  }
+
+  function acLoadAll() {
+    const ids = {};
+    state.acWatch.forEach(w => { ids[w.quoteId] = 1; });
+    Object.keys(state.acSim.holdings).forEach(q => { ids[q] = 1; });
+    return Promise.all(Object.keys(ids).map(q => acEnsure(q).catch(() => null)));
+  }
+
+  function acWatchItem(quoteId) { return state.acWatch.find(w => w.quoteId === quoteId) || null; }
+  function acActive() {
+    const id = state.acActiveId; if (!id) return null;
+    const w = acWatchItem(id); if (w) return w;
+    const h = state.acSim.holdings[id];
+    return h ? { quoteId: id, name: h.name, market: h.market } : null;
+  }
+
+  function acAddWatch(r) {
+    if (!acWatchItem(r.quoteId)) state.acWatch.push({ quoteId: r.quoteId, name: r.name, market: r.market });
+    state.acActiveId = r.quoteId;
+    acSave();
+    acEnsure(r.quoteId).catch(() => null).then(() => acRenderAll());
+  }
+
+  function acRemoveWatch(quoteId) {
+    state.acWatch = state.acWatch.filter(w => w.quoteId !== quoteId);
+    if (state.acActiveId === quoteId) state.acActiveId = state.acWatch.length ? state.acWatch[0].quoteId : null;
+    acSave(); acRenderAll();
+  }
+
+  /* ---------------- 下单 ---------------- */
+  function acDoTrade() {
+    const sim = state.acSim, w = acActive();
+    if (!w) { U.toast('请先选择标的', true); return; }
+    const side = state.acSide;
+    const shares = Math.floor(U.num(U.$('#acShares').value) || 0);
+    if (!(shares > 0)) { U.toast('请输入股数（整数）', true); return; }
+    acEnsure(w.quoteId).then(() => {
+      try {
+        const r = Sim.trade(sim, state.acPriceMap, {
+          side, quoteId: w.quoteId, name: w.name, market: w.market, shares, date: sim.cursor
+        });
+        acSave(); acRenderAll();
+        const cur = w.market === 'HK' ? ' HKD' : ' 元';
+        U.toast((side === 'buy' ? '✔ 买入 ' : '✔ 卖出 ') + w.name + ' ' + shares + ' 股 @ ' +
+          U.fmt(r.price, 3) + cur + '（手续费 ' + U.fmt(r.fee, 2) + ' 元）');
+      } catch (e) { U.toast(e.message, true); }
+    }).catch(e => U.toast('行情加载失败：' + e.message, true));
+  }
+
+  /* ---------------- 时间推进 ---------------- */
+  function acDoAdvance() {
+    const sim = state.acSim;
+    const to = U.$('#acTargetDate').value;
+    if (!to) { U.toast('请选择推进到的日期', true); return; }
+    if (to < sim.cursor) { U.toast('时间只能向后推进（当前 ' + sim.cursor + '）', true); return; }
+    if (to > U.today()) { U.toast('无未来数据，最远到今天 ' + U.today(), true); return; }
+    const qids = Object.keys(sim.holdings).filter(q => sim.holdings[q].shares > 0);
+    Promise.all(qids.map(q => acEnsure(q).catch(() => null))).then(() => {
+      const n = Sim.advance(sim, state.acPriceMap, state.acDivMap, to);
+      acSave(); acRenderAll();
+      const total = sim.cash + Sim.marketValue(sim, state.acPriceMap);
+      U.toast('⏩ 已推进到 ' + to + '，结算 ' + n + ' 笔分红 / 送股 · 总资产 ' + U.fmt(total, 0) + ' 元');
+    }).catch(e => U.toast('数据加载失败：' + e.message, true));
+  }
+
+  function acReset() {
+    if (!confirm('重置账户？将清空全部交易、持仓与分红记录。')) return;
+    state.acSim = acNewSim();
+    state.acWatch = []; state.acActiveId = null;
+    state.acPriceMap = {}; state.acDivMap = {};
+    U.$('#acTargetDate').value = state.acSim.cursor;
+    U.$('#acSetupStatus').innerHTML = '';
+    acSave(); acRenderAll();
+    U.toast('账户已重置：起始 ' + state.acSim.startDate + ' · 资金 ' + U.fmt(state.acSim.initCash, 0) + ' 元');
+  }
+
+  function acBoot() {
+    const restored = acRestore();
+    if (!restored) state.acSim = acNewSim();
+    const sim = state.acSim;
+    U.$('#acStartDate').value = sim.startDate;
+    U.$('#acCash').value = sim.initCash;
+    U.$('#acFx').value = sim.fx;
+    U.$('#acTax').checked = !!sim.taxApplies;
+    U.$('#acReinvest').checked = !!sim.reinvest;
+    U.$('#acTargetDate').value = sim.cursor;
+    if (!state.acActiveId && state.acWatch.length) state.acActiveId = state.acWatch[0].quoteId;
+    acSave();
+    acRenderAll();
+    acLoadAll().then(() => acRenderAll());
+  }
+
+  /* ---------------- 渲染 ---------------- */
+  function acRenderAll() {
+    renderAcState(); renderAcWatch(); renderAcTradeBox();
+    renderAcAdvMeta(); renderAcNav();
+    renderAcHold(); renderAcTrades(); renderAcDiv(); renderAcKline();
+  }
+
+  function renderAcState() {
+    const sim = state.acSim, pm = state.acPriceMap;
+    const mkt = Sim.marketValue(sim, pm);
+    const total = sim.cash + mkt;
+    const divTotal = sim.ledger.reduce((a, l) => a + (l.netCny || 0), 0);
+    let floating = 0, nHold = 0;
+    Object.keys(sim.holdings).forEach(q => {
+      const h = sim.holdings[q];
+      if (h.shares <= 0) return;
+      nHold++;
+      const px = Sim.priceAt(pm, q, sim.cursor);
+      if (px != null) floating += h.shares * px * (h.market === 'HK' ? sim.fx : 1) - h.costCny;
+    });
+    const retTotal = sim.initCash > 0 ? total / sim.initCash - 1 : 0;
+    const nBuy = sim.trades.filter(t => t.side === 'buy').length;
+    const nSell = sim.trades.length - nBuy;
+    U.$('#acCurDate').textContent = '当前时间节点：' + sim.cursor;
+    U.$('#acCards').innerHTML = [
+      card('账户总资产', U.fmt(total, 0) + ' 元', '初始 ' + U.fmt(sim.initCash, 0) + ' 元', U.cls(total - sim.initCash)),
+      card('总收益', U.signed(retTotal * 100, 2) + '%', '自 ' + sim.startDate, U.cls(retTotal)),
+      card('可用现金', U.fmt(sim.cash, 0) + ' 元', '含分红沉淀', ''),
+      card('持仓市值', U.fmt(mkt, 0) + ' 元', nHold + ' 只持仓', ''),
+      card('累计分红（税后）', U.fmt(divTotal, 0) + ' 元', '共 ' + sim.ledger.length + ' 笔入账', 'good'),
+      card('已实现盈亏', U.signed(sim.realized, 0) + ' 元', '卖出落袋', U.cls(sim.realized)),
+      card('浮动盈亏', U.signed(floating, 0) + ' 元', '按当前不复权价', U.cls(floating)),
+      card('交易次数', String(sim.trades.length), '买 ' + nBuy + ' / 卖 ' + nSell, '')
+    ].join('');
+  }
+
+  function renderAcWatch() {
+    const box = U.$('#acWatchList'); if (!box) return;
+    const sim = state.acSim;
+    if (!state.acWatch.length) { box.innerHTML = '<div class="small-hint">还没有标的，先在上方搜索添加。</div>'; return; }
+    box.innerHTML = state.acWatch.map(w => {
+      const h = sim.holdings[w.quoteId];
+      const px = Sim.priceAt(state.acPriceMap, w.quoteId, sim.cursor);
+      const cur = w.market === 'HK' ? 'HKD' : '元';
+      const sel = w.quoteId === state.acActiveId ? ' on' : '';
+      const hold = (h && h.shares > 0) ? ('持 ' + h.shares + ' 股') : '未持仓';
+      const priceTxt = px != null ? U.fmt(px, 3) + ' ' + cur : '加载中…';
+      return '<div class="ac-pos-item' + sel + '" data-qid="' + w.quoteId + '">' +
+        '<div class="ac-pos-name">' + w.name + ' <span class="badge">' + (w.market === 'HK' ? 'HK' : 'A') + '</span> ' +
+        '<span class="small-hint">' + hold + '</span></div>' +
+        '<div class="ac-pos-amt mono">' + priceTxt + '</div>' +
+        '<span class="x" data-qid="' + w.quoteId + '">✕</span></div>';
+    }).join('');
+    U.$$('.ac-pos-item', box).forEach(el => el.addEventListener('click', e => {
+      if (e.target.classList.contains('x')) return;
+      state.acActiveId = el.dataset.qid; acSave();
+      renderAcWatch(); renderAcTradeBox(); renderAcKline();
+    }));
+    U.$$('.ac-pos-item .x', box).forEach(x => x.addEventListener('click', ev => { ev.stopPropagation(); acRemoveWatch(x.dataset.qid); }));
+  }
+
+  function renderAcTradeBox() {
+    const box = U.$('#acTradeInfo'); if (!box) return;
+    const w = acActive(), sim = state.acSim;
+    const quick = U.$('#acQuick');
+    if (!w) { box.innerHTML = '请先在上方选择或添加标的'; quick.innerHTML = ''; return; }
+    const px = Sim.priceAt(state.acPriceMap, w.quoteId, sim.cursor);
+    const cur = w.market === 'HK' ? 'HKD' : '元';
+    const h = sim.holdings[w.quoteId];
+    const lot = 100;
+    let s = '<b>' + w.name + '</b> <span class="badge">' + (w.market === 'HK' ? 'HK' : 'A') + '</span>　' +
+      sim.cursor + ' 收盘价 <b class="mono">' + (px != null ? U.fmt(px, 3) + ' ' + cur : '无行情') + '</b>';
+    if (px != null && w.market === 'HK') s += ' <span class="small-hint">≈ ' + U.fmt(px * sim.fx, 3) + ' 元</span>';
+    if (h && h.shares > 0) s += '<br><span class="small-hint">持仓 ' + h.shares + ' 股 · 成本均价 ' +
+      U.fmt(h.costCny / h.shares, 3) + ' 元 · 累计分红 ' + U.fmt(h.divTotal || 0, 0) + ' 元</span>';
+    box.innerHTML = s;
+
+    const side = state.acSide;
+    let maxBuy = 0;
+    if (px != null && px > 0) {
+      const pxCny = px * sim.fx;
+      maxBuy = Math.floor((sim.cash / (1 + 0.0015)) / pxCny / lot) * lot;
+    }
+    const labels = side === 'buy' ? ['1手', '5手', '10手', '全仓'] : ['1手', '半仓', '全部'];
+    quick.innerHTML = labels.map(q => '<button class="ac-quick-btn" data-q="' + q + '">' + q + '</button>').join('');
+    U.$$('.ac-quick-btn', quick).forEach(b => b.addEventListener('click', () => {
+      const q = b.dataset.q, held = h ? h.shares : 0;
+      let sh = lot;
+      if (q === '5手') sh = lot * 5;
+      else if (q === '10手') sh = lot * 10;
+      else if (q === '全仓') sh = maxBuy;
+      else if (q === '半仓') sh = Math.floor((held / 2) / lot) * lot;
+      else if (q === '全部') sh = held;
+      U.$('#acShares').value = sh > 0 ? sh : '';
+    }));
+  }
+
+  function renderAcAdvMeta() {
+    U.$('#acAdvMeta').textContent = '当前 ' + state.acSim.cursor + ' · 最远可推进到 ' + U.today();
+  }
+
+  function renderAcNav() {
+    const sim = state.acSim, pm = state.acPriceMap;
+    const nav = Sim.nav(sim, pm);
+    const navNo = Sim.nav(sim, pm, { noDiv: true });
+    const total = nav.length ? nav[nav.length - 1].value : sim.cash;
+    U.$('#acNavMeta').textContent = nav.length + ' 个交易日 · ' + U.fmt(sim.initCash, 0) + ' → ' + U.fmt(total, 0) + ' 元';
+    if (nav.length < 2) { U.$('#acNavChart').innerHTML = '<div class="empty-inline">买入并推进时间后显示净值曲线</div>'; return; }
+    Chart.autoResize(U.$('#acNavChart'), {
+      dates: nav.map(n => n.date), height: 300, yFormat: v => U.fmt(v / 10000, 0) + '万',
+      series: [
+        { name: '账户总资产（含分红）', values: nav.map(n => n.value), color: '#4a9eff', width: 2 },
+        { name: '不计分红', values: navNo.map(n => n.value), color: '#96a5bd', width: 1.4, dash: '5,4' }
+      ]
+    });
+  }
+
+  function renderAcHold() {
+    const sim = state.acSim, pm = state.acPriceMap;
+    const qids = Object.keys(sim.holdings).filter(q => sim.holdings[q].shares > 0);
+    const tbl = U.$('#acHoldTable');
+    if (!qids.length) { tbl.innerHTML = '<tbody><tr><td style="text-align:center;color:#657792">当前无持仓</td></tr></tbody>'; return; }
+    tbl.innerHTML =
+      '<thead><tr><th>标的</th><th>持股</th><th>成本均价(元)</th><th>现价</th><th>市值(元)</th><th>浮动盈亏</th><th>累计分红</th></tr></thead><tbody>' +
+      qids.map(q => {
+        const h = sim.holdings[q];
+        const px = Sim.priceAt(pm, q, sim.cursor);
+        const cur = h.market === 'HK' ? ' HKD' : '';
+        const mkt = px != null ? h.shares * px * (h.market === 'HK' ? sim.fx : 1) : null;
+        const fl = mkt != null ? mkt - h.costCny : null;
+        const sel = q === state.acActiveId ? ' class="row-sel"' : '';
+        return '<tr data-qid="' + q + '"' + sel + '>' +
+          '<td>' + h.name + ' <span class="badge">' + (h.market === 'HK' ? 'HK' : 'A') + '</span></td>' +
+          '<td class="mono">' + h.shares + '</td>' +
+          '<td class="mono">' + U.fmt(h.costCny / h.shares, 3) + '</td>' +
+          '<td class="mono">' + (px != null ? U.fmt(px, 3) + cur : '—') + '</td>' +
+          '<td class="mono">' + (mkt != null ? U.fmt(mkt, 0) : '—') + '</td>' +
+          '<td class="mono ' + U.cls(fl) + '">' + (fl != null ? U.signed(fl, 0) : '—') + '</td>' +
+          '<td class="mono down">' + U.fmt(h.divTotal || 0, 0) + '</td>' +
+          '</tr>';
+      }).join('') + '</tbody>';
+    U.$$('#acHoldTable tbody tr').forEach(tr => tr.addEventListener('click', () => {
+      if (!tr.dataset.qid) return;
+      state.acActiveId = tr.dataset.qid; acSave();
+      renderAcWatch(); renderAcTradeBox(); renderAcHold(); renderAcKline();
+    }));
+  }
+
+  function renderAcTrades() {
+    const rows = state.acSim.trades.slice().reverse();
+    U.$('#acTradeTable').innerHTML =
+      '<thead><tr><th>日期</th><th>标的</th><th>方向</th><th>成交价</th><th>股数</th><th>金额</th><th>费用</th><th>实现盈亏</th></tr></thead><tbody>' +
+      (rows.length ? rows.map(t => {
+        const cur = t.cur === 'HKD' ? ' HKD' : ' 元';
+        return '<tr>' +
+          '<td>' + t.date + '</td>' +
+          '<td>' + t.name + '</td>' +
+          '<td class="' + (t.side === 'buy' ? 'up' : 'down') + '">' + (t.side === 'buy' ? '买入' : '卖出') + '</td>' +
+          '<td class="mono">' + U.fmt(t.price, 3) + cur + '</td>' +
+          '<td class="mono">' + t.shares + '</td>' +
+          '<td class="mono">' + U.fmt(t.amount, 0) + '</td>' +
+          '<td class="mono">' + U.fmt(t.fee, 2) + '</td>' +
+          '<td class="mono ' + (t.realized == null ? 'flat' : U.cls(t.realized)) + '">' + (t.realized == null ? '—' : U.signed(t.realized, 0)) + '</td>' +
+          '</tr>';
+      }).join('') : '<tr><td colspan="8" style="text-align:center;color:#657792">还没有交易</td></tr>') +
+      '</tbody>';
+  }
+
+  function renderAcDiv() {
+    const typeName = { annual: '年报', interim: '中报/季报', special: '特别', bonus: '送转' };
+    const rows = state.acSim.ledger.slice().reverse();
+    U.$('#acDivTable').innerHTML =
+      '<thead><tr><th>除权除息日</th><th>标的</th><th>类型</th><th>每股分红</th><th>送转</th><th>除权前持股</th><th>税前金额</th><th>红利税</th><th>税后入账</th></tr></thead><tbody>' +
+      (rows.length ? rows.map(l => {
+        const cur = l.cur === 'HKD' ? 'HKD' : '元';
+        const per = l.perShare > 0 ? U.fmt(l.perShare, 4) + ' ' + cur : '—';
+        const bonus = l.newShares > 0 ? ('+' + l.newShares + ' 股') : (l.bonusPerShare > 0 ? '送转' : '—');
+        const taxNote = l.taxRate > 0 ? '（' + U.fmt(l.taxRate * 100, 0) + '%）' : '';
+        return '<tr' + (l.unmodeled ? ' class="row-warn"' : '') + '>' +
+          '<td>' + l.date + '</td>' +
+          '<td>' + l.name + '</td>' +
+          '<td>' + (typeName[l.type] || l.type) + (l.unmodeled ? ' ⚠' : '') + '</td>' +
+          '<td class="mono">' + per + '</td>' +
+          '<td class="mono">' + bonus + '</td>' +
+          '<td class="mono">' + l.sharesBefore + '</td>' +
+          '<td class="mono">' + (l.grossCny ? U.fmt(l.grossCny, 0) : '—') + '</td>' +
+          '<td class="mono">' + (l.tax ? U.fmt(l.tax, 0) + taxNote : '—') + '</td>' +
+          '<td class="mono down">' + (l.netCny ? U.fmt(l.netCny, 0) : '—') +
+          (l.dripShares ? ' <span class="small-hint">再投' + l.dripShares + '股</span>' : '') + '</td>' +
+          '</tr>';
+      }).join('') : '<tr><td colspan="9" style="text-align:center;color:#657792">区间内没有分红 / 送股</td></tr>') +
+      '</tbody>';
+  }
+
+  function renderAcKline() {
+    const sim = state.acSim, pm = state.acPriceMap;
+    const w = acActive() || state.acWatch[0] || null;
+    const el = U.$('#acKlineChart');
+    if (!w) { U.$('#acKlineTitle').textContent = '历史K线（不复权）'; el.innerHTML = '<div class="empty-inline">请先添加标的</div>'; return; }
+    const rows = (pm[w.quoteId] || []).filter(x => x.date >= sim.startDate && x.date <= sim.cursor);
+    const cur = w.market === 'HK' ? ' HKD' : ' CNY';
+    U.$('#acKlineTitle').textContent = w.name + ' · 历史K线（不复权） ' + sim.startDate + ' → ' + sim.cursor;
+    if (!rows.length) { el.innerHTML = '<div class="empty-inline">暂无K线数据</div>'; return; }
+    const markers = [];
+    sim.trades.forEach(t => {
+      if (t.quoteId === w.quoteId && t.date >= sim.startDate && t.date <= sim.cursor)
+        markers.push({ date: t.date, color: t.side === 'buy' ? '#f0b73f' : '#4a9eff' });
+    });
+    (state.acDivMap[w.quoteId] || []).forEach(e => {
+      if (e.exDate >= sim.startDate && e.exDate <= sim.cursor) markers.push({ date: e.exDate, color: '#2fbf71' });
+    });
+    Chart.autoResize(el, {
+      dates: rows.map(x => x.date), height: 300, yFormat: v => U.fmt(v, 2),
+      markers,
+      series: [{ name: w.name + cur, values: rows.map(x => x.close), color: '#4a9eff', width: 1.8 }]
+    });
+  }
+
   /* ---------------- 页面切换 ---------------- */
   function showPage(name) {
     U.$$('.page').forEach(p => p.classList.remove('active'));
@@ -550,7 +1053,9 @@
     const pg = U.$('#page-' + name);
     if (pg) pg.classList.add('active');
     if (name === 'ledger') renderLedger();
-    if (name === 'snowball') { renderUniverse(); if (state.lastBacktest) renderBacktest(state.lastBacktest); }
+    if (name === 'snowball') { renderUniverseList(); if (state.lastBacktest) renderBacktest(state.lastBacktest); }
+    if (name === 'timemachine') { renderUniverseList(); if (state.tmRows) { renderTmTable(state.tmRows); renderTmCharts(); } }
+    if (name === 'account') { if (state.acSim) acRenderAll(); }
     if (name === 'dashboard' && state.current) {
       const c = state.seriesCache[state.current.quoteId];
       if (c) c.then(ctx => { renderDashCharts(ctx); });
@@ -594,7 +1099,50 @@
     const end = U.today(), start = U.addDays(end, -365 * 5);
     U.$('#btStart').value = start; U.$('#btEnd').value = end;
     U.$('#btnRunBacktest').addEventListener('click', runBacktest);
-    renderUniverse();
+    renderUniverseList();
+
+    // 回到那一天
+    bindSearch(U.$('#tmSearch'), U.$('#tmSearchResults'), r => {
+      addUniverse(r);
+      U.$('#tmSearch').value = '';
+    });
+    U.$('#tmDate').value = U.addDays(U.today(), -365 * 5);
+    U.$('#tmDate').max = U.today();
+    U.$('#btnTmRun').addEventListener('click', runTimeMachine);
+    U.$('#tmWindow').addEventListener('change', () => { if (state.tmRows) runTimeMachine(); });
+
+    // 模拟账户 · 交互交易台
+    U.$('#acStartDate').value = U.addDays(U.today(), -365 * 5);
+    U.$('#acStartDate').max = U.today();
+    U.$('#acTargetDate').max = U.today();
+    bindSearch(U.$('#acSearch'), U.$('#acSearchResults'), r => {
+      acAddWatch(r);
+      U.$('#acSearch').value = '';
+    });
+    U.$$('#acJumpSeg button').forEach(b => b.addEventListener('click', () => {
+      const m = parseInt(b.dataset.m, 10) || 0;
+      let to = U.addMonths(state.acSim.cursor, m);
+      if (to > U.today()) to = U.today();
+      U.$('#acTargetDate').value = to;
+    }));
+    U.$$('#acSideSeg button').forEach(b => b.addEventListener('click', () => {
+      U.$$('#acSideSeg button').forEach(x => x.classList.remove('on'));
+      b.classList.add('on');
+      state.acSide = b.dataset.side;
+      renderAcTradeBox();
+    }));
+    U.$('#btnAcTrade').addEventListener('click', acDoTrade);
+    U.$('#btnAcAdvance').addEventListener('click', acDoAdvance);
+    U.$('#btnAcReset').addEventListener('click', acReset);
+    ['#acFx'].forEach(sel => U.$(sel).addEventListener('change', () => {
+      state.acSim.fx = U.num(U.$('#acFx').value) || 0.92; acSave(); acRenderAll();
+    }));
+    U.$('#acTax').addEventListener('change', () => { state.acSim.taxApplies = U.$('#acTax').checked; acSave(); });
+    U.$('#acReinvest').addEventListener('change', () => { state.acSim.reinvest = U.$('#acReinvest').checked; acSave(); });
+    ['#acStartDate', '#acCash'].forEach(sel => U.$(sel).addEventListener('change', () => {
+      U.$('#acSetupStatus').innerHTML = '<span style="color:#ff9f43">⚠ 起始日期 / 初始资金的改动需点「重置账户」后才会生效。</span>';
+    }));
+    acBoot();
 
     // 账本
     U.$('#btnAddTrade').addEventListener('click', () => openTradeModal());

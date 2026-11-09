@@ -29,6 +29,8 @@
   <button class="tab active" data-tab="dashboard">📊 估值看板</button>
   <button class="tab" data-tab="target">🎯 目标价反推</button>
   <button class="tab" data-tab="drawdown">📉 回撤分析</button>
+  <button class="tab" data-tab="timemachine">⏳ 回到那一天</button>
+  <button class="tab" data-tab="account">💰 模拟账户</button>
   <button class="tab" data-tab="snowball">❄️ 滚雪球回测</button>
   <button class="tab" data-tab="ledger">📒 持仓账本</button>
 </nav>
@@ -174,6 +176,172 @@
           <div class="panel-head"><h3>历史重大回撤事件（Top 8）</h3></div>
           <div class="table-wrap"><table id="ddTable"></table></div>
         </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 回到那一天 ============ -->
+  <section class="page" id="page-timemachine">
+    <div class="panel">
+      <div class="panel-head"><h3>⏳ 回到那一天 · 复盘</h3></div>
+      <p class="hint">选一个日期，页面会「回到」那天：所有价格、估值分位、K 线都只显示到那一天为止，完全模拟当时的决策环境。</p>
+
+      <div class="field-row">
+        <div class="field"><label>回到哪一天</label><input id="tmDate" type="date"></div>
+        <div class="field"><label>回看窗口</label>
+          <select id="tmWindow">
+            <option value="1">近1年</option>
+            <option value="3">近3年</option>
+            <option value="5" selected>近5年</option>
+            <option value="0">全部历史</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="field">
+        <label>标的池（与「滚雪球回测」共用）</label>
+        <div class="searchbox small">
+          <input id="tmSearch" type="text" placeholder="搜索并添加标的…" autocomplete="off">
+          <div id="tmSearchResults" class="search-results hidden"></div>
+        </div>
+        <div id="tmUniList" class="uni-list"></div>
+      </div>
+
+      <button id="btnTmRun" class="btn btn-primary">回到那一天</button>
+      <div id="tmStatus" class="status-line"></div>
+    </div>
+
+    <div id="tmResult" class="hidden">
+      <div class="panel">
+        <div class="panel-head">
+          <h3 id="tmResultTitle">那一天</h3>
+          <span class="meta" id="tmResultMeta"></span>
+        </div>
+        <div class="table-wrap"><table id="tmTable"></table></div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head"><h3 id="tmChartTitle">K线</h3></div>
+        <div class="chart" id="tmPriceChart"></div>
+        <div class="legend-note">灰带 = 该窗口 PE 20%~80% 分位对应价格区间；● = 回到的那一天（K 线止于该日，不显示未来）。</div>
+      </div>
+
+      <div class="grid two">
+        <div class="panel">
+          <div class="panel-head"><h3>PE 分位走势（截至那天）</h3></div>
+          <div class="chart" id="tmPeChart"></div>
+        </div>
+        <div class="panel">
+          <div class="panel-head"><h3>PB 分位走势（截至那天）</h3></div>
+          <div class="chart" id="tmPbChart"></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 模拟账户 ============ -->
+  <section class="page" id="page-account">
+    <div class="panel">
+      <div class="panel-head"><h3>💰 模拟账户 · 交易台</h3></div>
+      <p class="hint">像真实炒股软件一样操作：在历史某日按<b>真实不复权股价</b>买入 / 卖出，点「时间推进」前进，期间的年报 / 中报 / 特别分红按<b>除权除息日</b>自动入账（送转自动加股）。进度自动保存在本机，切页 / 刷新不丢失。</p>
+
+      <div class="field-row">
+        <div class="field"><label>📅 起始日期（穿越到）</label><input id="acStartDate" type="date"></div>
+        <div class="field"><label>初始资金（元）</label><input id="acCash" type="number" value="1000000" step="10000"></div>
+        <div class="field"><label>人民币/港币汇率（1 HKD = ? CNY）</label><input id="acFx" type="number" step="0.001" value="0.92"></div>
+      </div>
+      <div class="field-row">
+        <div class="field"><label>分红计税</label>
+          <label class="chk"><input type="checkbox" id="acTax" checked> 扣红利税（A股按持股期 / 港股通 20%）</label>
+        </div>
+        <div class="field"><label>分红处理</label>
+          <label class="chk"><input type="checkbox" id="acReinvest"> 红利再投资（按除息日收盘价买入）</label>
+        </div>
+        <div class="field"><label>&nbsp;</label><button id="btnAcReset" class="btn">♻ 重置账户</button></div>
+      </div>
+      <div class="status-line" id="acSetupStatus"></div>
+    </div>
+
+    <div class="grid two-col-flex">
+      <div class="panel">
+        <div class="panel-head"><h3>账户状态</h3><span class="meta" id="acCurDate"></span></div>
+        <div class="grid cards" id="acCards"></div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head"><h3>下单交易</h3></div>
+        <div class="searchbox small">
+          <input id="acSearch" type="text" placeholder="搜索并添加标的…" autocomplete="off">
+          <div id="acSearchResults" class="search-results hidden"></div>
+        </div>
+        <div id="acWatchList" class="ac-pos-list"></div>
+        <div class="ac-trade-box">
+          <div class="ac-trade-info" id="acTradeInfo">请先在上方选择或添加标的</div>
+          <div class="field-row">
+            <div class="field"><label>方向</label>
+              <div class="seg" id="acSideSeg">
+                <button data-side="buy" class="on">买入</button>
+                <button data-side="sell">卖出</button>
+              </div>
+            </div>
+            <div class="field"><label>股数</label><input id="acShares" type="number" min="0" step="100" value="100"></div>
+            <div class="field"><label>&nbsp;</label><button id="btnAcTrade" class="btn btn-primary">下单</button></div>
+          </div>
+          <div class="ac-quick" id="acQuick"></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head"><h3>⏩ 时间推进</h3><span class="meta" id="acAdvMeta"></span></div>
+      <div class="field-row">
+        <div class="field"><label>推进到日期</label><input id="acTargetDate" type="date"></div>
+        <div class="field"><label>快捷</label>
+          <div class="seg" id="acJumpSeg">
+            <button data-m="1">+1月</button>
+            <button data-m="3">+3月</button>
+            <button data-m="6">+6月</button>
+            <button data-m="12">+1年</button>
+            <button data-m="60">+5年</button>
+          </div>
+        </div>
+        <div class="field"><label>&nbsp;</label><button id="btnAcAdvance" class="btn btn-primary">⏩ 推进并结算分红</button></div>
+      </div>
+    </div>
+
+    <div id="acResult">
+      <div class="panel">
+        <div class="panel-head">
+          <h3>账户总资产走势</h3>
+          <span class="meta" id="acNavMeta"></span>
+        </div>
+        <div class="chart" id="acNavChart"></div>
+        <div class="legend-note">蓝线 = 账户总资产（含分红现金沉淀）；灰虚线 = 假如完全不分红的对比。</div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head"><h3>持仓明细</h3><span class="meta">点击行可切换下方 K 线与交易标的</span></div>
+        <div class="table-wrap"><table id="acHoldTable"></table></div>
+      </div>
+
+      <div class="grid two">
+        <div class="panel">
+          <div class="panel-head"><h3>交易流水</h3></div>
+          <div class="table-wrap table-scroll"><table id="acTradeTable"></table></div>
+        </div>
+        <div class="panel">
+          <div class="panel-head"><h3>分红 / 送转账本</h3></div>
+          <div class="table-wrap table-scroll"><table id="acDivTable"></table></div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h3 id="acKlineTitle">历史K线（不复权）</h3>
+          <span class="meta">● 金 = 买入；● 蓝 = 卖出；● 绿 = 分红 / 送股除权</span>
+        </div>
+        <div class="chart" id="acKlineChart"></div>
+        <div class="legend-note">K 线区间为「起始日 → 当前时间节点」。</div>
       </div>
     </div>
   </section>

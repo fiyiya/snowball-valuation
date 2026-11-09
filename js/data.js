@@ -242,7 +242,127 @@
       });
   }
 
-  App.Data = { searchStock, getKline, getValuationA, getHkFinancials, buildSeries };
+  /* ============================================================
+   * 模拟账户专用数据：不复权日线 + 全口径分红事件
+   * ============================================================ */
+
+  /* 不复权日线（腾讯 kline/kline 返回 day，A股/港股通用） */
+  function klineRawFromTencent(quoteId, start, end) {
+    const tc = U.toTencentCode(quoteId);
+    const MAX = 640;
+    const all = new Map();
+    let curEnd = end, guard = 0;
+    const finalize = () => Array.from(all.values())
+      .filter(r => r.date >= start && r.date <= end)
+      .sort((a, b) => a.date < b.date ? -1 : 1);
+    const step = () => {
+      const url = 'https://web.ifzq.gtimg.cn/appstock/app/kline/kline?param=' +
+        tc + ',day,' + start + ',' + curEnd + ',' + MAX;
+      return Net.request(url, { ttl: 3 * 3600 * 1000, persist: true }).then(d => {
+        const pack = d && d.data && d.data[tc];
+        if (!pack) throw new Error('腾讯不复权K线无数据');
+        const arr = pack.day || [];
+        if (!arr.length) return finalize();
+        let minDate = null;
+        arr.forEach(r => {
+          if (!r || r.length < 6) return;
+          all.set(r[0], { date: r[0], open: +r[1], close: +r[2], high: +r[3], low: +r[4], vol: +r[5] });
+          if (!minDate || r[0] < minDate) minDate = r[0];
+        });
+        if (arr.length >= MAX && minDate && minDate > start && guard < 15) {
+          guard++; curEnd = U.addDays(minDate, -1); return step();
+        }
+        return finalize();
+      });
+    };
+    return step();
+  }
+  function getKlineRaw(quoteId, start, end) {
+    return klineRawFromTencent(quoteId, start, end)
+      .then(rows => { if (!rows || rows.length < 2) throw new Error('不复权数据不足'); return rows; });
+  }
+
+  /* A股分红类型：年报(12月报告期) / 中报·季报 / 特别 */
+  function classifyA(r) {
+    const txt = r.IMPL_PLAN_PROFILE || '';
+    if (txt.indexOf('特别') >= 0 || txt.indexOf('特殊') >= 0) return 'special';
+    return String(r.REPORT_DATE || '').slice(5, 7) === '12' ? 'annual' : 'interim';
+  }
+
+  /* A股分红：东财 RPT_SHAREBONUS_DET */
+  function getADividends(code) {
+    const url = DC + '?reportName=RPT_SHAREBONUS_DET&columns=ALL&filter=' +
+      encodeURIComponent('(SECURITY_CODE="' + code + '")') +
+      '&pageSize=200&sortColumns=EX_DIVIDEND_DATE&sortTypes=-1';
+    return Net.request(url, { type: 'jsonp', ttl: 24 * 3600 * 1000, persist: true }).then(d => {
+      const rows = (d && d.result && d.result.data) || [];
+      return rows
+        .filter(r => r.EX_DIVIDEND_DATE && r.ASSIGN_PROGRESS === '实施分配')
+        .map(r => {
+          // 送转合计（每10股）：优先用 BONUS_IT_RATIO，否则 送股+转增
+          const bonus10 = r.BONUS_IT_RATIO != null ? r.BONUS_IT_RATIO
+            : ((+r.BONUS_RATIO || 0) + (+r.IT_RATIO || 0));
+          return {
+            market: 'A', currency: 'CNY',
+            exDate: String(r.EX_DIVIDEND_DATE).slice(0, 10),
+            recordDate: r.EQUITY_RECORD_DATE ? String(r.EQUITY_RECORD_DATE).slice(0, 10) : null,
+            payDate: null,
+            cashPerShare: (+r.PRETAX_BONUS_RMB || 0) / 10,   // 每10股派 → 每股
+            bonusPerShare: (+bonus10 || 0) / 10,
+            type: classifyA(r),
+            label: r.IMPL_PLAN_PROFILE || ''
+          };
+        })
+        .filter(x => x.cashPerShare > 0 || x.bonusPerShare > 0)
+        .sort((a, b) => a.exDate < b.exDate ? -1 : 1);
+    }).catch(() => []);
+  }
+
+  /* 港股分红：解析 PLAN_EXPLAIN 文本（金额/送股/实物分派） */
+  function parseHkDividend(r) {
+    const txt = r.PLAN_EXPLAIN || '';
+    const period = r.ASSIGN_PERIOD || '';
+    let type = 'annual';
+    if (period.indexOf('特别') >= 0 || txt.indexOf('特殊') >= 0) type = 'special';
+    else if (period.indexOf('中期') >= 0 || period.indexOf('半年') >= 0) type = 'interim';
+    let cash = 0, bonus = 0, m;
+    // 每股派港币X元 / 每股派X港元 / 相当于每股派X港元（实物分派折现金额）
+    if ((m = txt.match(/每股派\s*(?:港币|港元|人民币|美元)?\s*([\d.]+)\s*(?:港元|港币|元|美元)/))) cash = +m[1];
+    if (!cash && (m = txt.match(/相当于每股派\s*([\d.]+)\s*(?:港元|港币|元)/))) cash = +m[1];
+    // 仅识别明确的「送股」，「分派N股」多为其他公司股票的实物分派，不视作送股
+    if ((m = txt.match(/每\s*(\d+)\s*股\s*(?:送|派送)\s*(\d+)\s*股/))) bonus = (+m[2]) / (+m[1]);
+    return {
+      market: 'HK', currency: 'HKD',
+      exDate: String(r.EX_DIVIDEND_DATE).slice(0, 10),
+      recordDate: r.RECORD_DATE ? String(r.RECORD_DATE).slice(0, 10) : null,
+      payDate: r.DIVIDEND_DATE ? String(r.DIVIDEND_DATE).slice(0, 10) : null,
+      cashPerShare: cash, bonusPerShare: bonus,
+      type, label: txt,
+      unmodeled: cash === 0 && bonus === 0
+    };
+  }
+
+  function getHkDividends(code) {
+    const url = DC + '?reportName=RPT_HKF10_INFO_DIVIDEND&columns=ALL&filter=' +
+      encodeURIComponent('(SECUCODE="' + code.padStart(5, '0') + '.HK")') +
+      '&pageSize=200&sortColumns=EX_DIVIDEND_DATE&sortTypes=-1';
+    return Net.request(url, { type: 'jsonp', ttl: 24 * 3600 * 1000, persist: true }).then(d => {
+      const rows = (d && d.result && d.result.data) || [];
+      return rows
+        .filter(r => r.EX_DIVIDEND_DATE && (!r.ASSIGN_PROGRESS || r.ASSIGN_PROGRESS === '实施分配'))
+        .map(parseHkDividend)
+        .filter(x => x.cashPerShare > 0 || x.bonusPerShare > 0 || x.unmodeled)
+        .sort((a, b) => a.exDate < b.exDate ? -1 : 1);
+    }).catch(() => []);
+  }
+
+  function getDividends(quoteId) {
+    const code = String(quoteId).split('.')[1];
+    return U.marketOf(quoteId) === 'HK' ? getHkDividends(code) : getADividends(code);
+  }
+
+  App.Data = { searchStock, getKline, getValuationA, getHkFinancials, buildSeries,
+    getKlineRaw, getDividends };
   App.CONFIG = Object.assign({ reportLagDays: 90 }, App.CONFIG || {});
 
 })(window.App);

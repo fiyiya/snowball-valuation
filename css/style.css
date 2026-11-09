@@ -154,6 +154,8 @@ th:first-child,td:first-child{text-align:left}
 th{color:var(--txt3);font-weight:600;position:sticky;top:0;background:var(--panel2);z-index:1;font-size:11.5px}
 tbody tr:hover{background:rgba(74,158,255,.07)}
 td.mono{font-family:ui-monospace,Menlo,monospace}
+tbody tr.row-sel{background:rgba(240,183,63,.13);box-shadow:inset 3px 0 0 var(--gold)}
+tbody tr.row-warn{background:rgba(255,159,67,.08)}
 
 /* ---------- empty ---------- */
 .empty-state{text-align:center;padding:70px 20px}
@@ -184,6 +186,23 @@ td.mono{font-family:ui-monospace,Menlo,monospace}
 .uni-item .x:hover{color:var(--up)}
 .picked{margin-top:8px;font-size:12.5px;color:var(--accent)}
 .badge{font-size:10.5px;padding:1px 6px;border-radius:4px;background:rgba(74,158,255,.16);color:#8ec4ff}
+
+/* ---------- account positions ---------- */
+.ac-pos-list{display:flex;flex-direction:column;gap:6px;margin-top:8px;max-height:300px;overflow:auto}
+.ac-pos-item{display:grid;grid-template-columns:1fr 140px 22px;align-items:center;gap:8px;background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:7px 10px;font-size:12.5px}
+.ac-pos-item .ac-pos-name{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ac-pos-item .ac-pos-amt{width:100%;padding:5px 8px;border-radius:6px;background:var(--bg2);border:1px solid var(--line2);color:var(--txt);outline:none;font-size:12.5px;text-align:right}
+.ac-pos-item .ac-pos-amt:focus{border-color:var(--accent)}
+.ac-pos-item .x{color:var(--txt3);cursor:pointer;text-align:center}
+.ac-pos-item .x:hover{color:var(--up)}
+.ac-pos-item.on{border-color:var(--accent);box-shadow:inset 3px 0 0 var(--accent)}
+.ac-pos-item:hover{background:var(--panel)}
+.ac-trade-box{margin-top:12px;padding-top:12px;border-top:1px dashed var(--line)}
+.ac-trade-info{font-size:12.5px;color:var(--txt2);line-height:1.7;margin-bottom:10px}
+.ac-quick{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
+.ac-quick-btn{padding:4px 12px;border-radius:999px;background:var(--panel2);border:1px solid var(--line2);color:var(--txt2);font-size:12px}
+.ac-quick-btn:hover{border-color:var(--accent);color:var(--accent)}
+.field label.chk{display:flex;align-items:center;gap:2px;font-size:12.5px;color:var(--txt2);padding:8px 0;cursor:pointer;border:none;margin:0;font-weight:400}
 
 /* ---------- modal ---------- */
 .modal{position:fixed;inset:0;background:rgba(5,8,14,.7);backdrop-filter:blur(3px);z-index:200;display:flex;align-items:center;justify-content:center;padding:20px}

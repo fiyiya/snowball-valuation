@@ -36,6 +36,7 @@
   App.COST = COST;
 
   const LOT = { A: 100, HK: 100 };  // 近似手数
+  const fxOf = (sim, market) => (market === 'HK' ? sim.fx : 1);  // A股汇率恒为 1
 
   /** 预处理：把 series 转成回测用的列式数据 */
   function prepare(series, windowYears) {
@@ -245,5 +246,200 @@
     };
   }
 
-  App.Engine = { run, prepare };
+  /* ============================================================
+   * 交互式模拟账户 Sim：任意时间节点买卖 + 推进时间 + 全口径分红
+   *   sim = {
+   *     initCash, cash, startDate, cursor, fx, taxApplies, reinvest, realized,
+   *     holdings:{ qid:{quoteId,name,market,shares,costCny,divTotal,firstBuyDate} },
+   *     trades:[{date,quoteId,name,market,side,price,shares,amount,fee,cur,realized?}],
+   *     ledger:[分红记录], applied:{ qid:[已结算的除权日] }
+   *   }
+   *   价格一律用「不复权」；分红按除权除息日结算（送股自动调整股数）
+   * ============================================================ */
+  function simPriceAt(priceMap, qid, date) {
+    const rows = priceMap && priceMap[qid];
+    if (!rows || !rows.length) return null;
+    let lo = 0, hi = rows.length - 1, ans = -1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (rows[mid].date <= date) { ans = mid; lo = mid + 1; } else hi = mid - 1;
+    }
+    return ans >= 0 ? rows[ans].close : null;
+  }
+
+  const Sim = {
+    create(initCash, startDate, opts) {
+      opts = opts || {};
+      return {
+        initCash: initCash, cash: initCash, startDate: startDate, cursor: startDate,
+        fx: opts.fx != null ? opts.fx : 0.92,
+        taxApplies: opts.taxApplies !== false,
+        reinvest: !!opts.reinvest,
+        holdings: {}, trades: [], ledger: [], applied: {}, realized: 0
+      };
+    },
+
+    priceAt: simPriceAt,
+
+    /** 市值（CNY）：期末/当前时点所有持仓按不复权价折算 */
+    marketValue(sim, priceMap, date) {
+      const d = date || sim.cursor;
+      let v = 0;
+      Object.keys(sim.holdings).forEach(q => {
+        const h = sim.holdings[q];
+        if (h.shares <= 0) return;
+        const px = simPriceAt(priceMap, q, d);
+        if (px != null) v += h.shares * px * fxOf(sim, h.market);
+      });
+      return v;
+    },
+    total(sim, priceMap, date) { return sim.cash + Sim.marketValue(sim, priceMap, date); },
+
+    /** 下单：t = { side:'buy'|'sell', quoteId, name, market, shares, date } */
+    trade(sim, priceMap, t) {
+      const date = t.date || sim.cursor;
+      const px = simPriceAt(priceMap, t.quoteId, date);
+      if (px == null || px <= 0) throw new Error('「' + t.name + '」在 ' + date + ' 没有行情（可能早于上市日）');
+      const pxCny = px * fxOf(sim, t.market), lot = LOT[t.market] || 1;
+      const shares = Math.floor(t.shares);
+      if (!(shares > 0)) throw new Error('股数需为大于 0 的整数');
+      const cur = t.market === 'HK' ? 'HKD' : 'CNY';
+
+      if (t.side === 'buy') {
+        if (lot > 1 && shares % lot !== 0) throw new Error('买入股数需为 ' + lot + ' 的整数倍（1 手 = ' + lot + ' 股）');
+        const amount = shares * pxCny, fee = COST[t.market].buy(amount);
+        if (amount + fee > sim.cash + 1e-6) {
+          throw new Error('可用现金不足（需 ' + U.fmt(amount + fee, 0) + ' 元，现有 ' + U.fmt(sim.cash, 0) + ' 元）');
+        }
+        sim.cash -= amount + fee;
+        let h = sim.holdings[t.quoteId];
+        if (!h) h = sim.holdings[t.quoteId] = { quoteId: t.quoteId, name: t.name, market: t.market, shares: 0, costCny: 0, divTotal: 0, firstBuyDate: null };
+        if (h.shares <= 0) h.firstBuyDate = date;
+        h.shares += shares; h.costCny += amount + fee; h.name = t.name;
+        sim.trades.push({ date, quoteId: t.quoteId, name: t.name, market: t.market, side: 'buy', price: px, shares, amount, fee, cur });
+        return { amount, fee, price: px };
+      }
+
+      const h = sim.holdings[t.quoteId];
+      if (!h || h.shares <= 0) throw new Error('没有该标的的持仓');
+      if (shares > h.shares) throw new Error('卖出股数超过持仓（持有 ' + h.shares + ' 股）');
+      const amount = shares * pxCny, fee = COST[t.market].sell(amount);
+      const avg = h.costCny / h.shares;
+      const realized = amount - fee - avg * shares;
+      sim.cash += amount - fee;
+      h.costCny -= avg * shares; h.shares -= shares;
+      if (h.shares <= 0) { h.shares = 0; h.costCny = 0; h.firstBuyDate = null; }
+      sim.realized += realized;
+      sim.trades.push({ date, quoteId: t.quoteId, name: t.name, market: t.market, side: 'sell', price: px, shares, amount, fee, cur, realized });
+      return { amount, fee, price: px, realized };
+    },
+
+    /** 推进时间到 toDate，结算区间内全口径分红，返回入账笔数 */
+    advance(sim, priceMap, divMap, toDate) {
+      const to = toDate;
+      if (to < sim.cursor) throw new Error('时间只能向后推进');
+
+      const evs = [];
+      Object.keys(sim.holdings).forEach(qid => {
+        const h = sim.holdings[qid];
+        if (h.shares <= 0) return;
+        const ap = sim.applied[qid] || (sim.applied[qid] = []);
+        (divMap[qid] || []).forEach(e => {
+          if (e.exDate > sim.cursor && e.exDate <= to && ap.indexOf(e.exDate) < 0) evs.push({ h, e });
+        });
+      });
+      evs.sort((a, b) => a.e.exDate < b.e.exDate ? -1 : (a.e.exDate > b.e.exDate ? 1 : 0));
+
+      let count = 0;
+      evs.forEach(({ h, e }) => {
+        const ap = sim.applied[h.quoteId];
+        if (h.shares <= 0) { ap.push(e.exDate); return; }
+        const before = h.shares;
+        const holdDays = h.firstBuyDate ? U.days(h.firstBuyDate, e.exDate) : 0;
+        let grossCny = 0, tax = 0, taxRate = 0, netCny = 0;
+        if (e.cashPerShare > 0) {
+          grossCny = before * e.cashPerShare * fxOf(sim, e.market);
+          // A股按持股期差别化：<1月 20%、1月~1年 10%、>1年 免征；港股通 20%
+          if (sim.taxApplies) taxRate = e.market === 'HK' ? 0.20 : (holdDays < 30 ? 0.20 : (holdDays < 365 ? 0.10 : 0));
+          tax = grossCny * taxRate; netCny = grossCny - tax;
+          sim.cash += netCny;
+          h.divTotal = (h.divTotal || 0) + netCny;
+        }
+        let newShares = 0;
+        if (e.bonusPerShare > 0) { newShares = Math.floor(before * e.bonusPerShare); h.shares += newShares; }
+
+        let dripShares = 0, dripFee = 0, dripCost = 0;
+        if (sim.reinvest && netCny > 0) {
+          const px = simPriceAt(priceMap, h.quoteId, e.exDate);
+          if (px != null && px > 0) {
+            const pxCny = px * fxOf(sim, h.market), lot = LOT[h.market] || 1;
+            let sh = Math.floor((netCny / (1 + 0.0015)) / pxCny / lot) * lot;
+            while (sh > 0) {
+              const amt = sh * pxCny, fee = COST[h.market].buy(amt);
+              if (amt + fee <= sim.cash + 1e-6) {
+                sim.cash -= amt + fee; h.shares += sh; h.costCny += amt + fee;
+                dripShares = sh; dripFee = fee; dripCost = amt + fee; break;
+              }
+              sh -= lot;
+            }
+          }
+        }
+
+        sim.ledger.push({ date: e.exDate, quoteId: h.quoteId, name: h.name, market: h.market, type: e.type,
+          perShare: e.cashPerShare || 0, cur: e.currency, sharesBefore: before, grossCny, tax, taxRate, netCny,
+          newShares, bonusPerShare: e.bonusPerShare || 0, unmodeled: !!e.unmodeled, label: e.label || '',
+          dripShares, dripFee, dripCost });
+        ap.push(e.exDate);
+        count++;
+      });
+
+      sim.cursor = to;
+      return count;
+    },
+
+    /** 账户净值序列：从 startDate 到 cursor 回放交易/分红事件；opts.noDiv=true 时忽略分红（仅股价对比） */
+    nav(sim, priceMap, opts) {
+      const skipDiv = !!(opts && opts.noDiv);
+      const calSet = new Set();
+      Object.keys(priceMap).forEach(q => {
+        (priceMap[q] || []).forEach(r => { if (r.date >= sim.startDate && r.date <= sim.cursor) calSet.add(r.date); });
+      });
+      const cal = Array.from(calSet).sort();
+      if (!cal.length) cal.push(sim.startDate);
+      if (cal[cal.length - 1] !== sim.cursor) cal.push(sim.cursor);
+
+      const evs = [];
+      sim.trades.forEach(t => { if (t.date <= sim.cursor) evs.push({ date: t.date, t, d: null }); });
+      sim.ledger.forEach(l => { if (l.date <= sim.cursor) evs.push({ date: l.date, t: null, d: l }); });
+      evs.sort((a, b) => a.date < b.date ? -1 : (a.date > b.date ? 1 : 0));
+
+      let cash = sim.initCash, ei = 0;
+      const sh = {};
+      const mkt = {};   // quoteId -> market（用于按市场折算汇率）
+      sim.trades.forEach(t => { mkt[t.quoteId] = t.market; });
+      sim.ledger.forEach(l => { mkt[l.quoteId] = l.market; });
+      const out = [];
+      cal.forEach(day => {
+        while (ei < evs.length && evs[ei].date <= day) {
+          const e = evs[ei++];
+          if (e.t) {
+            const t = e.t;
+            if (t.side === 'buy') { cash -= t.amount + t.fee; sh[t.quoteId] = (sh[t.quoteId] || 0) + t.shares; }
+            else { cash += t.amount - t.fee; sh[t.quoteId] = (sh[t.quoteId] || 0) - t.shares; }
+          } else if (!skipDiv) {
+            const l = e.d;
+            cash += l.netCny;
+            if (l.newShares) sh[l.quoteId] = (sh[l.quoteId] || 0) + l.newShares;
+            if (l.dripShares) { cash -= (l.dripCost || 0); sh[l.quoteId] = (sh[l.quoteId] || 0) + l.dripShares; }
+          }
+        }
+        let v = cash;
+        Object.keys(sh).forEach(q => { const p = simPriceAt(priceMap, q, day); if (p != null) v += sh[q] * p * fxOf(sim, mkt[q]); });
+        out.push({ date: day, value: v });
+      });
+      return out;
+    }
+  };
+
+  App.Engine = { run, prepare, Sim };
 })(window.App);
