@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>滚雪球 · A股/港股估值回撤助手</title>
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">❄️</span>
+    <div>
+      <h1>滚雪球 · 估值回撤助手</h1>
+      <p class="sub">A股 + 港股 · PE/PB 分位 · 回撤监控 · 高估换低估回测</p>
+    </div>
+  </div>
+  <div class="topbar-actions">
+    <div class="searchbox">
+      <input id="globalSearch" type="text" placeholder="输入股票代码 / 名称，如 600519、茅台、00700、腾讯" autocomplete="off">
+      <div id="searchResults" class="search-results hidden"></div>
+    </div>
+    <button id="btnDiagnose" class="btn btn-ghost" title="测试数据源连通性">数据自检</button>
+  </div>
+</header>
+
+<nav class="tabs" id="tabs">
+  <button class="tab active" data-tab="dashboard">📊 估值看板</button>
+  <button class="tab" data-tab="target">🎯 目标价反推</button>
+  <button class="tab" data-tab="drawdown">📉 回撤分析</button>
+  <button class="tab" data-tab="snowball">❄️ 滚雪球回测</button>
+  <button class="tab" data-tab="ledger">📒 持仓账本</button>
+</nav>
+
+<main id="main">
+
+  <!-- ============ 估值看板 ============ -->
+  <section class="page active" id="page-dashboard">
+    <div id="dashEmpty" class="empty-state">
+      <div class="empty-icon">🔍</div>
+      <h2>先选一只股票</h2>
+      <p>在上方搜索框输入代码或名称，或从下面的自选池中直接点击。</p>
+      <div class="quick-symbols">
+        <button class="chip" data-sym="1.600519">贵州茅台</button>
+        <button class="chip" data-sym="1.601318">中国平安</button>
+        <button class="chip" data-sym="0.000858">五粮液</button>
+        <button class="chip" data-sym="1.600036">招商银行</button>
+        <button class="chip" data-sym="116.00700">腾讯控股</button>
+        <button class="chip" data-sym="116.09988">阿里巴巴</button>
+        <button class="chip" data-sym="116.03690">美团</button>
+      </div>
+    </div>
+
+    <div id="dashContent" class="hidden">
+      <div class="stock-head">
+        <div>
+          <h2 id="dashName">—</h2>
+          <span id="dashMeta" class="meta">—</span>
+        </div>
+        <div class="price-block">
+          <span id="dashPrice" class="price">—</span>
+          <span id="dashChange" class="change">—</span>
+        </div>
+      </div>
+
+      <div class="grid cards" id="metricCards"></div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h3>历史走势与估值带</h3>
+          <div class="seg" id="dashRangeSeg">
+            <button data-range="1" class="on">近1年</button>
+            <button data-range="3">近3年</button>
+            <button data-range="5">近5年</button>
+            <button data-range="0">全部</button>
+          </div>
+        </div>
+        <div class="chart" id="dashPriceChart"></div>
+        <div class="legend-note">灰带 = 当前区间 PE 的 20%~80% 分位估值对应的价格区间；线 = 收盘价。</div>
+      </div>
+
+      <div class="grid two">
+        <div class="panel">
+          <div class="panel-head"><h3>PE 分位走势</h3></div>
+          <div class="chart" id="dashPeChart"></div>
+        </div>
+        <div class="panel">
+          <div class="panel-head"><h3>PB 分位走势</h3></div>
+          <div class="chart" id="dashPbChart"></div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head"><h3>估值分位总览</h3></div>
+        <div class="table-wrap"><table id="dashPercentileTable"></table></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 目标价反推 ============ -->
+  <section class="page" id="page-target">
+    <div class="panel">
+      <div class="panel-head"><h3>当前标的</h3></div>
+      <div id="targetNeedStock" class="empty-inline">请先在「估值看板」或搜索框选择一只股票。</div>
+      <div id="targetBody" class="hidden">
+        <div class="kv-row" id="targetCurrent"></div>
+
+        <div class="calc-grid">
+          <div class="calc-card">
+            <h4>① 目标估值 → 买入限价</h4>
+            <p class="hint">想知道「跌到多少倍 PE 时该股价多少」？输入目标值即可。</p>
+            <div class="field">
+              <label>指标</label>
+              <select id="tgtMetric">
+                <option value="pe">PE (TTM)</option>
+                <option value="pb">PB</option>
+                <option value="percentile">历史分位 (0-100%)</option>
+              </select>
+            </div>
+            <div class="field">
+              <label>目标值</label>
+              <input id="tgtValue" type="number" step="0.01" value="12">
+            </div>
+            <div class="field" id="tgtPctHistWrap">
+              <label>分位参考区间</label>
+              <select id="tgtPctHist">
+                <option value="0">全部历史</option>
+                <option value="5">近5年</option>
+                <option value="3">近3年</option>
+                <option value="1">近1年</option>
+              </select>
+            </div>
+            <button id="btnCalcTarget" class="btn btn-primary">计算买入限价</button>
+            <div id="targetResult" class="result-box"></div>
+          </div>
+
+          <div class="calc-card">
+            <h4>② 历史同估值「重演」</h4>
+            <p class="hint">历史上每次落到该估值区间时，之后 3/6/12 个月的收益分布。</p>
+            <div class="field">
+              <label>估值区间（PE 分位，%）</label>
+              <div class="range-pair">
+                <input id="histLo" type="number" value="0" min="0" max="100">
+                <span>~</span>
+                <input id="histHi" type="number" value="20" min="0" max="100">
+              </div>
+            </div>
+            <button id="btnCalcHist" class="btn btn-primary">统计后续收益</button>
+            <div id="histResult" class="result-box"></div>
+          </div>
+        </div>
+
+        <div class="panel inner">
+          <div class="panel-head"><h3>历史同估值点位（可点击查看当时环境）</h3></div>
+          <div class="table-wrap"><table id="histEventsTable"></table></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 回撤分析 ============ -->
+  <section class="page" id="page-drawdown">
+    <div class="panel">
+      <div class="panel-head"><h3>当前标的</h3></div>
+      <div id="ddNeedStock" class="empty-inline">请先在「估值看板」或搜索框选择一只股票。</div>
+      <div id="ddBody" class="hidden">
+        <div class="grid cards" id="ddCards"></div>
+        <div class="panel inner">
+          <div class="panel-head"><h3>回撤曲线（水下曲线）</h3></div>
+          <div class="chart" id="ddChart"></div>
+        </div>
+        <div class="panel inner">
+          <div class="panel-head"><h3>历史重大回撤事件（Top 8）</h3></div>
+          <div class="table-wrap"><table id="ddTable"></table></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 滚雪球回测 ============ -->
+  <section class="page" id="page-snowball">
+    <div class="grid two-col-flex">
+      <div class="panel config-panel">
+        <div class="panel-head"><h3>策略配置</h3></div>
+
+        <div class="field">
+          <label>标的池（可多选，A股/港股混合）</label>
+          <div class="searchbox small">
+            <input id="uniSearch" type="text" placeholder="搜索并添加标的…" autocomplete="off">
+            <div id="uniSearchResults" class="search-results hidden"></div>
+          </div>
+          <div id="uniList" class="uni-list"></div>
+        </div>
+
+        <div class="field-row">
+          <div class="field"><label>开始日期</label><input id="btStart" type="date"></div>
+          <div class="field"><label>结束日期</label><input id="btEnd" type="date"></div>
+        </div>
+        <div class="field"><label>初始资金（元）</label><input id="btCash" type="number" value="1000000" step="10000"></div>
+
+        <details open>
+          <summary>滚雪球规则</summary>
+          <div class="field-row">
+            <div class="field"><label>高估减仓阈值（分位 %）</label><input id="btHigh" type="number" value="80"></div>
+            <div class="field"><label>低估买入阈值（分位 %）</label><input id="btLow" type="number" value="20"></div>
+          </div>
+          <div class="field-row">
+            <div class="field"><label>触发减仓比例（%）</label><input id="btReduce" type="number" value="30"></div>
+            <div class="field"><label>单票仓位上限（%）</label><input id="btMaxPos" type="number" value="25"></div>
+          </div>
+          <div class="field">
+            <label>调仓频率</label>
+            <select id="btFreq">
+              <option value="M">每月</option>
+              <option value="Q" selected>每季</option>
+              <option value="H">每半年</option>
+              <option value="Y">每年</option>
+            </select>
+          </div>
+          <div class="field">
+            <label><input type="checkbox" id="btUseDD" checked> 叠加回撤条件：从高点回撤超</label>
+            <input id="btDD" type="number" value="30" class="inline-num"> % 才买入
+          </div>
+          <div class="field">
+            <label>估值分位统计窗口</label>
+            <select id="btWindow">
+              <option value="5" selected>近5年（滚动）</option>
+              <option value="3">近3年（滚动）</option>
+              <option value="10">近10年（滚动）</option>
+              <option value="0">全历史（滚动）</option>
+            </select>
+          </div>
+        </details>
+
+        <details>
+          <summary>成本与汇率</summary>
+          <div class="field"><label>人民币/港币汇率（1 HKD = ? CNY）</label><input id="btFx" type="number" step="0.001" value="0.92"></div>
+          <div class="field small-hint">
+            <b>已内置成本模型</b>：A股 佣金0.025‰(最低5元) + 印花税0.05%(卖出) + 过户费0.001%；<br>
+            港股 佣金0.025‰ + 印花税0.1% + 交易费0.00565% + 结算费0.002% + 交易征费0.0027% + 财汇局征费0.00015%。<br>
+            <b>本版未计</b>：现金分红再投入、港股通20%红利税、汇率波动对持仓的影响（用固定汇率折算）。价格用<b>前复权</b>，故分红影响已隐含在价格中。
+          </div>
+        </details>
+
+        <button id="btnRunBacktest" class="btn btn-primary btn-block">运行回测</button>
+        <div id="btStatus" class="status-line"></div>
+      </div>
+
+      <div class="panel result-panel">
+        <div class="panel-head"><h3>回测结果</h3></div>
+        <div id="btEmpty" class="empty-inline">配置好标的池与规则后点击「运行回测」。</div>
+        <div id="btResult" class="hidden">
+          <div class="grid cards" id="btCards"></div>
+          <div class="panel inner">
+            <div class="panel-head"><h3>净值曲线对比</h3></div>
+            <div class="chart" id="btNavChart"></div>
+          </div>
+          <div class="panel inner">
+            <div class="panel-head"><h3>策略回撤</h3></div>
+            <div class="chart" id="btDdChart"></div>
+          </div>
+          <div class="panel inner">
+            <div class="panel-head"><h3>交易流水</h3></div>
+            <div class="table-wrap table-scroll"><table id="btTradeTable"></table></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 持仓账本 ============ -->
+  <section class="page" id="page-ledger">
+    <div class="panel">
+      <div class="panel-head">
+        <h3>滚雪球 · 小账本</h3>
+        <div>
+          <button id="btnAddTrade" class="btn btn-primary">+ 记录一笔交易</button>
+          <button id="btnClearLedger" class="btn btn-ghost">清空</button>
+        </div>
+      </div>
+      <p class="hint">记录每一次「高估卖出 / 低估买入」，自动追踪持仓成本摊薄与已实现盈亏。数据仅存本地浏览器。</p>
+      <div class="grid cards" id="ledgerCards"></div>
+      <div class="panel inner">
+        <div class="panel-head"><h3>持仓成本走势</h3></div>
+        <div class="chart" id="ledgerChart"></div>
+      </div>
+      <div class="table-wrap table-scroll"><table id="ledgerTable"></table></div>
+    </div>
+  </section>
+
+</main>
+
+<div id="toast" class="toast hidden"></div>
+
+<!-- 模态：添加交易 -->
+<div id="modal" class="modal hidden">
+  <div class="modal-box">
+    <h3 id="modalTitle">记录一笔交易</h3>
+    <div class="field-row">
+      <div class="field"><label>日期</label><input id="trDate" type="date"></div>
+      <div class="field"><label>方向</label>
+        <select id="trSide"><option value="buy">买入</option><option value="sell">卖出</option></select>
+      </div>
+    </div>
+    <div class="field"><label>股票</label>
+      <div class="searchbox small">
+        <input id="trSearch" type="text" placeholder="搜索股票…" autocomplete="off">
+        <div id="trSearchResults" class="search-results hidden"></div>
+      </div>
+      <div id="trPicked" class="picked"></div>
+    </div>
+    <div class="field-row">
+      <div class="field"><label>价格</label><input id="trPrice" type="number" step="0.001"></div>
+      <div class="field"><label>数量（股）</label><input id="trShares" type="number" step="100"></div>
+    </div>
+    <div class="field"><label>备注</label><input id="trNote" type="text" placeholder="如：PE分位15%，低估加仓"></div>
+    <div class="modal-actions">
+      <button id="btnModalCancel" class="btn btn-ghost">取消</button>
+      <button id="btnModalSave" class="btn btn-primary">保存</button>
+    </div>
+  </div>
+</div>
+
+<!-- 模态：数据自检 -->
+<div id="diagModal" class="modal hidden">
+  <div class="modal-box wide">
+    <h3>数据源自检</h3>
+    <p class="hint">依次测试各数据接口连通性。若某项失败，多为被限流或该源临时故障，稍后重试即可。</p>
+    <div id="diagList" class="diag-list"></div>
+    <div class="modal-actions">
+      <button id="btnDiagRun" class="btn btn-primary">开始自检</button>
+      <button id="btnDiagClose" class="btn btn-ghost">关闭</button>
+    </div>
+  </div>
+</div>
+
+<script src="js/util.js"></script>
+<script src="js/data.js"></script>
+<script src="js/indicators.js"></script>
+<script src="js/charts.js"></script>
+<script src="js/engine.js"></script>
+<script src="js/ui.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>
